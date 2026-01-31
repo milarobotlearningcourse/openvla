@@ -33,6 +33,7 @@ import numpy as np
 import robosuite.utils.transform_utils as T
 import tqdm
 from libero.libero import benchmark
+from datasets import Dataset, DatasetDict, Image, Features, Sequence, Value, Array2D, Array3D
 
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -40,7 +41,7 @@ from experiments.robot.libero.libero_utils import (
 )
 
 
-IMAGE_RESOLUTION = 256
+IMAGE_RESOLUTION = 64
 
 
 def is_noop(action, prev_action=None, threshold=1e-4):
@@ -80,7 +81,7 @@ def main(args):
 
     # Prepare JSON file to record success/false and initial states per episode
     metainfo_json_dict = {}
-    metainfo_json_out_path = f"./experiments/robot/libero/{args.libero_task_suite}_metainfo.json"
+    metainfo_json_out_path = f"./openvla/experiments/robot/libero/{args.libero_task_suite}_metainfo.json"
     with open(metainfo_json_out_path, "w") as f:
         # Just test that we can write to this file (we overwrite it later)
         json.dump(metainfo_json_dict, f)
@@ -95,7 +96,7 @@ def main(args):
     num_success = 0
     num_noops = 0
 
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm(range(1)):
         # Get task in suite
         task = task_suite.get_task(task_id)
         env, task_description = get_libero_env(task, "llava", resolution=IMAGE_RESOLUTION)
@@ -111,7 +112,8 @@ def main(args):
         new_data_file = h5py.File(new_data_path, "w")
         grp = new_data_file.create_group("data")
 
-        for i in range(len(orig_data.keys())):
+        # for i in range(len(orig_data.keys())):
+        for i in range(1):
             # Get demo data
             demo_data = orig_data[f"demo_{i}"]
             orig_actions = demo_data["actions"][()]
@@ -169,6 +171,9 @@ def main(args):
                         )
                     )
                 )
+                ## Rotate images by 180 degrees to account for upside-down rendering
+                obs["agentview_image"] = np.rot90(obs["agentview_image"], 2)
+                obs["robot0_eye_in_hand_image"] = np.rot90(obs["robot0_eye_in_hand_image"], 2)
                 agentview_images.append(obs["agentview_image"])
                 eye_in_hand_images.append(obs["robot0_eye_in_hand_image"])
 
@@ -197,6 +202,11 @@ def main(args):
                 ep_data_grp.create_dataset("robot_states", data=np.stack(robot_states, axis=0))
                 ep_data_grp.create_dataset("rewards", data=rewards)
                 ep_data_grp.create_dataset("dones", data=dones)
+                ep_data_grp.create_dataset("init_states", data=np.array(orig_states[0]))
+                # import os
+                path_ = os.path.join("./", f"libero-{0}-task-id-{task_id}-init-id-{i}.mp4")
+                import imageio
+                imageio.mimsave(path_, agentview_images, fps=20)
 
                 num_success += 1
 
@@ -234,6 +244,110 @@ def main(args):
     print(f"Saved metainfo JSON at: {metainfo_json_out_path}")
 
 
+def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
+    """
+    Push regenerated LIBERO dataset to Hugging Face Hub.
+    
+    Args:
+        dataset_dir: Path to the directory containing regenerated HDF5 files
+        repo_id: Hugging Face repository ID (e.g., 'gberseth/libero_spatial')
+        task_suite_name: Name of the task suite (e.g., 'libero_spatial')
+    """
+    from PIL import Image
+    print(f"Preparing to push dataset to Hugging Face: {repo_id}")
+    
+    # Collect all HDF5 files in the dataset directory
+    hdf5_files = [f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')]
+    print(f"Found {len(hdf5_files)} HDF5 files")
+    
+    all_episodes = []
+    
+    for hdf5_file in tqdm.tqdm(hdf5_files, desc="Processing HDF5 files"):
+        task_name = hdf5_file.replace('_demo.hdf5', '')
+        file_path = os.path.join(dataset_dir, hdf5_file)
+        
+        with h5py.File(file_path, 'r') as f:
+            data_grp = f['data']
+            num_demos = len(data_grp.keys())
+            
+            for demo_idx in range(num_demos):
+                demo_key = f"demo_{demo_idx}"
+                if demo_key not in data_grp:
+                    continue
+                    
+                demo = data_grp[demo_key]
+                obs_grp = demo['obs']
+                
+                # Convert images from numpy arrays to list of PIL Images
+                agentview_images = obs_grp['agentview_rgb'][()]
+                eye_in_hand_images = obs_grp['eye_in_hand_rgb'][()]
+
+                for j in range(agentview_images.shape[0]):
+
+                    _data = {
+                        'goal_text_full': task_name,
+                        'task_suite': task_suite_name,
+                        'demo_id': demo_idx,
+                        'episode_length': len(demo['actions']),
+                        # Observations
+                        'gripper_states': obs_grp['gripper_states'][j],
+                        'joint_states': obs_grp['joint_states'][j],
+                        'ee_states': obs_grp['ee_states'][j],
+                        'ee_pos': obs_grp['ee_pos'][j],
+                        'ee_ori': obs_grp['ee_ori'][j],
+                        'img':  Image.fromarray(agentview_images[j].astype(np.uint8), mode='RGB'),
+                        'eye_in_hand_rgb': Image.fromarray(eye_in_hand_images[j].astype(np.uint8), mode='RGB'),
+                        'goal_img': Image.fromarray(agentview_images[-1].astype(np.uint8), mode='RGB'),
+                        # Actions and states
+                        'action': demo['actions'][j],
+                        'states': demo['states'][j],
+                        'pose': demo['robot_states'][j][:7],
+                        'rewards': demo['rewards'][j],
+                        'terminated': demo['dones'][j],
+                        'init_state': np.array(demo['init_states']),
+                    }
+                    # episode_data.append(_data)
+                
+                    all_episodes.append(_data)
+    
+    print(f"Collected {len(all_episodes)} episodes total")
+    
+    # Define features for the dataset
+    # features = Features({
+    #     'task_name': Value('string'),
+    #     'task_suite': Value('string'),
+    #     'demo_id': Value('int32'),
+    #     'episode_length': Value('int32'),
+    #     'gripper_states': Sequence(Value('float32')),
+    #     'joint_states': Sequence(Value('float32')),
+    #     'ee_states': Sequence(Value('float32')),
+    #     'ee_pos': Sequence(Value('float32')),
+    #     'ee_ori': Sequence(Value('float32')),
+    #     'img': Image(),
+    #     'eye_in_hand_rgb': Image(),
+    #     'goal_img': Image(),
+    #     'actions': Sequence(Value('float32')),
+    #     'states': Sequence(Value('float32')),
+    #     'robot_states': Sequence(Value('float32')),
+    #     'rewards': Value('uint8'),
+    #     'dones': Value('uint8'),
+    #     'init_states': Value('float32'),
+    # })
+    
+    # Create dataset
+    dataset = Dataset.from_list(all_episodes)
+    
+    print(f"Created dataset with {len(dataset)} episodes")
+    print(f"Dataset features: {dataset.features}")
+    
+    # Push to hub
+    print(f"Pushing dataset to Hugging Face Hub: {repo_id}")
+    dataset.push_to_hub(repo_id, private=False)
+    
+    print(f"Successfully pushed dataset to {repo_id}")
+    return dataset
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
@@ -243,7 +357,15 @@ if __name__ == "__main__":
                         help="Path to directory containing raw HDF5 dataset. Example: ./LIBERO/libero/datasets/libero_spatial", required=True)
     parser.add_argument("--libero_target_dir", type=str,
                         help="Path to regenerated dataset directory. Example: ./LIBERO/libero/datasets/libero_spatial_no_noops", required=True)
+    parser.add_argument("--push_to_hub", action="store_true",
+                        help="Push the regenerated dataset to Hugging Face Hub")
+    parser.add_argument("--hf_repo_id", type=str, default="gberseth/libero_spatial",
+                        help="Hugging Face repository ID. Example: gberseth/libero_spatial")
     args = parser.parse_args()
 
     # Start data regeneration
     main(args)
+    
+    # Optionally push to Hugging Face
+    if args.push_to_hub:
+        push_to_huggingface(args.libero_target_dir, args.hf_repo_id, args.libero_task_suite)
