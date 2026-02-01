@@ -85,6 +85,10 @@ def main(args):
     with open(metainfo_json_out_path, "w") as f:
         # Just test that we can write to this file (we overwrite it later)
         json.dump(metainfo_json_dict, f)
+    
+    # Prepare HDF5 file to record initial states and goal images indexed by demo number
+    init_states_hdf5_path = f"./openvla/experiments/robot/libero/{args.libero_task_suite}_init_states_and_goals.hdf5"
+    init_states_hdf5_file = h5py.File(init_states_hdf5_path, "w")
 
     # Get task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -97,6 +101,7 @@ def main(args):
     num_noops = 0
 
     for task_id in tqdm.tqdm(range(1)):
+    # for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task in suite
         task = task_suite.get_task(task_id)
         env, task_description = get_libero_env(task, "llava", resolution=IMAGE_RESOLUTION)
@@ -132,6 +137,7 @@ def main(args):
             gripper_states = []
             joint_states = []
             robot_states = []
+            # robot_pose = []
             agentview_images = []
             eye_in_hand_images = []
 
@@ -155,6 +161,7 @@ def main(args):
                     robot_states.append(
                         np.concatenate([obs["robot0_gripper_qpos"], obs["robot0_eef_pos"], obs["robot0_eef_quat"]])
                     )
+                # robot_pose.append(np.concatenate([obs["robot0_eef_pos"], obs["robot0_eef_quat"], obs["robot0_gripper_qpos"]]))
 
                 # Record original action (from demo)
                 actions.append(action)
@@ -221,6 +228,17 @@ def main(args):
                 metainfo_json_dict[task_key][episode_key] = {}
             metainfo_json_dict[task_key][episode_key]["success"] = bool(done)
             metainfo_json_dict[task_key][episode_key]["initial_state"] = orig_states[0].tolist()
+            
+            # Record initial state and goal image in HDF5 file
+            if task_key not in init_states_hdf5_file:
+                task_grp = init_states_hdf5_file.create_group(task_key)
+            else:
+                task_grp = init_states_hdf5_file[task_key]
+            
+            demo_grp = task_grp.create_group(episode_key)
+            demo_grp.create_dataset("init_state", data=orig_states[0])
+            if len(agentview_images) > 0:
+                demo_grp.create_dataset("goal_img", data=agentview_images[-1])
 
             # Write metainfo dict to JSON file
             # (We repeatedly overwrite, rather than doing this once at the end, just in case the script crashes midway)
@@ -240,8 +258,12 @@ def main(args):
         new_data_file.close()
         print(f"Saved regenerated demos for task '{task_description}' at: {new_data_path}")
 
+    # Close the init_states HDF5 file
+    init_states_hdf5_file.close()
+    
     print(f"Dataset regeneration complete! Saved new dataset at: {args.libero_target_dir}")
     print(f"Saved metainfo JSON at: {metainfo_json_out_path}")
+    print(f"Saved init_states HDF5 at: {init_states_hdf5_path}")
 
 
 def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
@@ -283,7 +305,8 @@ def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
                 eye_in_hand_images = obs_grp['eye_in_hand_rgb'][()]
 
                 for j in range(agentview_images.shape[0]):
-
+                    action = demo['actions'][j]
+                    # action[6] = ((action[6] + 1.0) / 2.0) * -1.0  # Convert gripper action to [0, 1] range and invert
                     _data = {
                         'goal_text_full': task_name,
                         'task_suite': task_suite_name,
@@ -299,9 +322,9 @@ def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
                         'eye_in_hand_rgb': Image.fromarray(eye_in_hand_images[j].astype(np.uint8), mode='RGB'),
                         'goal_img': Image.fromarray(agentview_images[-1].astype(np.uint8), mode='RGB'),
                         # Actions and states
-                        'action': demo['actions'][j],
+                        'action': action,
                         'states': demo['states'][j],
-                        'pose': demo['robot_states'][j][:7],
+                        'pose': demo['robot_states'][j],
                         'rewards': demo['rewards'][j],
                         'terminated': demo['dones'][j],
                         'init_state': np.array(demo['init_states']),
