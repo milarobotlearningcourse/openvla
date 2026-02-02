@@ -16,10 +16,12 @@ Usage:
         --libero_target_dir <PATH TO TARGET DIR>
 
     Example (LIBERO-Spatial):
-        python experiments/robot/libero/regenerate_libero_dataset.py \
+        python openvla/experiments/robot/libero/regenerate_libero_dataset.py \
             --libero_task_suite libero_spatial \
-            --libero_raw_data_dir ./LIBERO/libero/datasets/libero_spatial \
-            --libero_target_dir ./LIBERO/libero/datasets/libero_spatial_no_noops
+            --libero_raw_data_dir /home/mila/g/glen.berseth/playground/LIBERO/datasets/datasets/libero_spatial/ \
+            --libero_target_dir /network/projects/real-g-grp/libero/targets_clean/ \
+            --push_to_hub \
+            --hf_repo_id gberseth/libero_spatial_no_noops
 
 """
 
@@ -34,6 +36,7 @@ import robosuite.utils.transform_utils as T
 import tqdm
 from libero.libero import benchmark
 from datasets import Dataset, DatasetDict, Image, Features, Sequence, Value, Array2D, Array3D
+from huggingface_hub import HfApi
 
 from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
@@ -100,8 +103,8 @@ def main(args):
     num_success = 0
     num_noops = 0
 
-    for task_id in tqdm.tqdm(range(1)):
-    # for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    # for task_id in tqdm.tqdm(range(1)):
+    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task in suite
         task = task_suite.get_task(task_id)
         env, task_description = get_libero_env(task, "llava", resolution=IMAGE_RESOLUTION)
@@ -117,8 +120,8 @@ def main(args):
         new_data_file = h5py.File(new_data_path, "w")
         grp = new_data_file.create_group("data")
 
-        # for i in range(len(orig_data.keys())):
-        for i in range(1):
+        for i in range(len(orig_data.keys())):
+        # for i in range(1):
             # Get demo data
             demo_data = orig_data[f"demo_{i}"]
             orig_actions = demo_data["actions"][()]
@@ -211,9 +214,9 @@ def main(args):
                 ep_data_grp.create_dataset("dones", data=dones)
                 ep_data_grp.create_dataset("init_states", data=np.array(orig_states[0]))
                 # import os
-                path_ = os.path.join("./", f"libero-{0}-task-id-{task_id}-init-id-{i}.mp4")
-                import imageio
-                imageio.mimsave(path_, agentview_images, fps=20)
+                # path_ = os.path.join("./", f"libero-{0}-task-id-{task_id}-init-id-{i}.mp4")
+                # import imageio
+                # imageio.mimsave(path_, agentview_images, fps=20)
 
                 num_success += 1
 
@@ -387,8 +390,45 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Start data regeneration
-    main(args)
+    # main(args)
     
     # Optionally push to Hugging Face
     if args.push_to_hub:
-        push_to_huggingface(args.libero_target_dir, args.hf_repo_id, args.libero_task_suite)
+        # push_to_huggingface(args.libero_target_dir, args.hf_repo_id, args.libero_task_suite)
+        
+        # Also push the init_states HDF5 data as a separate dataset
+        init_states_hdf5_path = f"./openvla/experiments/robot/libero/{args.libero_task_suite}_init_states_and_goals.hdf5"
+        if os.path.exists(init_states_hdf5_path):
+            # Construct separate repo ID for init_states (e.g., "gberseth/libero_spatial_init_states")
+            username = args.hf_repo_id.split('/')[0]
+            init_states_repo_id = f"{username}/{args.libero_task_suite}_init_states"
+            
+            print(f"Creating dataset from init_states HDF5: {init_states_hdf5_path}")
+            
+            # Load init_states HDF5 and convert to dataset
+            init_states_data = []
+            with h5py.File(init_states_hdf5_path, 'r') as f:
+                for task_name in f.keys():
+                    task_grp = f[task_name]
+                    for demo_key in task_grp.keys():
+                        demo_grp = task_grp[demo_key]
+                        data_entry = {
+                            'task_name': task_name,
+                            'demo_id': demo_key,
+                            'init_state': demo_grp['init_state'][()],
+                        }
+                        # Add goal image if it exists
+                        if 'goal_img' in demo_grp:
+                            from PIL import Image as PILImage
+                            data_entry['goal_img'] = PILImage.fromarray(demo_grp['goal_img'][()].astype(np.uint8), mode='RGB')
+                        
+                        init_states_data.append(data_entry)
+            
+            # Create and push dataset
+            init_states_dataset = Dataset.from_list(init_states_data)
+            print(f"Created init_states dataset with {len(init_states_dataset)} entries")
+            print(f"Pushing init_states dataset to Hugging Face Hub: {init_states_repo_id}")
+            init_states_dataset.push_to_hub(init_states_repo_id, private=False)
+            print(f"Successfully pushed init_states dataset to {init_states_repo_id}")
+        else:
+            print(f"Warning: init_states HDF5 file not found at {init_states_hdf5_path}")
