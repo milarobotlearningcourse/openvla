@@ -269,6 +269,169 @@ def main(args):
     print(f"Saved init_states HDF5 at: {init_states_hdf5_path}")
 
 
+def push_to_huggingface_lerobot(dataset_dir, repo_id, task_suite_name):
+    """
+    Push regenerated LIBERO dataset to Hugging Face Hub.
+    
+    Args:
+        dataset_dir: Path to the directory containing regenerated HDF5 files
+        repo_id: Hugging Face repository ID (e.g., 'gberseth/libero_spatial')
+        task_suite_name: Name of the task suite (e.g., 'libero_spatial')
+    """
+    from PIL import Image as PILImage
+    from datasets import Dataset, DatasetDict, Image as HfImage, Features, Sequence, Value, Array2D, Array3D
+    from datasets import (
+        Image as HfImage,
+        Features as HfFeatures,
+        Sequence as HfSequence,
+        Value as HfValue,
+    )
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset    
+
+    print(f"Preparing to push dataset to Hugging Face: {repo_id}")
+    
+    # Collect all HDF5 files in the dataset directory
+    hdf5_files = [f for f in os.listdir(dataset_dir) if f.endswith('.hdf5')]
+    print(f"Found {len(hdf5_files)} HDF5 files")
+
+    # final_features = HfFeatures({
+    #     'task_name': HfSequence(HfValue('string')),
+    #     'task_suite': HfSequence(HfValue('string')),
+    #     'demo_id': HfSequence(HfValue('int32')),
+    #     'episode_length': HfValue('int32'),
+    #     'gripper_states': HfSequence(HfValue('float32')),
+    #     'joint_states': HfSequence(HfValue('float32')),
+    #     'ee_states': HfSequence(HfValue('float32')),
+    #     'ee_pos': HfSequence(HfValue('float32')),
+    #     'ee_ori': HfSequence(HfValue('float32')),
+    #     'img': HfImage(),
+    #     'eye_in_hand_rgb': HfImage(),
+    #     'goal_img': HfImage(),
+    #     'actions': HfSequence(HfValue('float32')),
+    #     'states': HfSequence(HfValue('float32')),
+    #     'robot_states': HfSequence(HfValue('float32')),
+    #     'rewards': HfSequence(HfValue('uint8')),
+    #     'dones': HfSequence(HfValue('uint8')),
+    #     'init_states': HfSequence(HfValue('float32')),
+    # })
+    LIBERO_FEATURES = {
+        "observation.images.image": {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": ["height", "width", "rgb"],
+        },
+        "observation.images.wrist_image": {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": ["height", "width", "rgb"],
+        },
+        "observation.state": {
+            "dtype": "float64",
+            "shape": (9,),
+            "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper", "gripper"]},
+        },
+        # "observation.states.ee_state": {
+        #     "dtype": "float32",
+        #     "shape": (6,),
+        #     "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3"]},
+        # },
+        # "observation.states.joint_state": {
+        #     "dtype": "float32",
+        #     "shape": (7,),
+        #     "names": {"motors": ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]},
+        # },
+        # "observation.states.gripper_state": {
+        #     "dtype": "float32",
+        #     "shape": (2,),
+        #     "names": {"motors": ["gripper", "gripper"]},
+        # },
+        "action": {
+            "dtype": "float64",
+            "shape": (7,),
+            "names": {"motors": ["x", "y", "z", "axis_angle1", "axis_angle2", "axis_angle3", "gripper"]},
+        },
+    }
+
+    ## If '/home/mila/g/glen.berseth/.cache/huggingface/lerobot/gberseth/libero_spatial_0_lerobot' exists remove it
+    cache_dir = '/home/mila/g/glen.berseth/.cache/huggingface/lerobot/gberseth/libero_spatial_0_lerobot'
+    if os.path.exists(cache_dir):
+        ## Force remove directory and all its contents
+        import shutil
+        shutil.rmtree(cache_dir)
+        # os.rmdir(cache_dir)
+    ## Some details from https://github.com/Tavish9/any4lerobot/blob/main/libero2lerobot/libero_h5.py#L59
+    dataset = LeRobotDataset.create(
+    repo_id=repo_id,
+    features=LIBERO_FEATURES,
+    fps=15,
+    # ... other parameters like fps, etc.
+    )
+    
+    all_episodes = []
+    
+    for hdf5_file in tqdm.tqdm(hdf5_files, desc="Processing HDF5 files"):
+        task_name = hdf5_file.replace('_demo.hdf5', '')
+        file_path = os.path.join(dataset_dir, hdf5_file)
+        
+        with h5py.File(file_path, 'r') as f:
+            data_grp = f['data']
+            num_demos = len(data_grp.keys())
+            
+            # for demo_idx in range(num_demos):
+            for demo_idx in range(2):
+                demo_key = f"demo_{demo_idx}"
+                if demo_key not in data_grp:
+                    continue
+                    
+                demo = data_grp[demo_key]
+                obs_grp = demo['obs']
+                
+                # Convert images from numpy arrays to list of PIL Images
+                agentview_images = obs_grp['agentview_rgb'][()]
+                eye_in_hand_images = obs_grp['eye_in_hand_rgb'][()]
+
+                for j in range(agentview_images.shape[0]):
+                    action = demo['actions'][j]
+                    # action[6] = ((action[6] + 1.0) / 2.0) * -1.0  # Convert gripper action to [0, 1] range and invert
+                    _data = {
+                        'task': task_name,
+                        # 'task_suite': task_suite_name,
+                        # 'demo_id': demo_idx,
+                        # 'episode_length': len(demo['actions']),
+                        # Observations
+                        # 'gripper_states': obs_grp['gripper_states'][j],
+                        # 'joint_states': obs_grp['joint_states'][j],
+                        # 'ee_states': obs_grp['ee_states'][j],
+                        # 'ee_pos': obs_grp['ee_pos'][j],
+                        # 'ee_ori': obs_grp['ee_ori'][j],
+                        'observation.images.image':  agentview_images[j].astype(np.uint8),
+                        'observation.images.wrist_image': eye_in_hand_images[j].astype(np.uint8),
+                        # 'goal_img': agentview_images[-1].astype(np.uint8),
+                        # Actions and states
+                        'action': action,
+                        # 'observation.state': demo['states'][j],
+                        'observation.state': demo['robot_states'][j],
+                        # 'rewards': demo['rewards'][j],
+                        # 'terminated': demo['dones'][j],
+                        # 'init_state': np.array(demo['init_states']),
+                    }
+                    # episode_data.append(_data)
+                    dataset.add_frame(_data)
+                    # all_episodes.append(_data)
+                dataset.save_episode()
+
+    dataset.finalize()  # Closes parquet writers, writes metadata footers
+    
+    print(f"Created dataset with {len(dataset)} episodes")
+    print(f"Dataset features: {dataset.features}")
+    
+    # Push to hub
+    print(f"Pushing dataset to Hugging Face Hub: {repo_id}")
+    dataset.push_to_hub(repo_id, private=False)
+    
+    print(f"Successfully pushed dataset to {repo_id}")
+    return dataset
+
 def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
     """
     Push regenerated LIBERO dataset to Hugging Face Hub.
@@ -279,6 +442,7 @@ def push_to_huggingface(dataset_dir, repo_id, task_suite_name):
         task_suite_name: Name of the task suite (e.g., 'libero_spatial')
     """
     from PIL import Image
+
     print(f"Preparing to push dataset to Hugging Face: {repo_id}")
     
     # Collect all HDF5 files in the dataset directory
@@ -389,46 +553,55 @@ if __name__ == "__main__":
                         help="Hugging Face repository ID. Example: gberseth/libero_spatial")
     args = parser.parse_args()
 
+    """Example command-line arguments:
+    python openvla/experiments/robot/libero/regenerate_libero_dataset.py \
+    --libero_task_suite libero_spatial \
+    --libero_raw_data_dir "/home/mila/g/glen.berseth/playground/LIBERO/datasets/datasets/libero_spatial/" \
+    --libero_target_dir "/network/projects/real-g-grp/libero/targets_clean/" \
+    --push_to_hub \
+    --hf_repo_id gberseth/libero_spatial_0_lerobot
+    """
+
     # Start data regeneration
     # main(args)
     
     # Optionally push to Hugging Face
     if args.push_to_hub:
-        # push_to_huggingface(args.libero_target_dir, args.hf_repo_id, args.libero_task_suite)
+        push_to_huggingface_lerobot(args.libero_target_dir, args.hf_repo_id, args.libero_task_suite)
         
-        # Also push the init_states HDF5 data as a separate dataset
-        init_states_hdf5_path = f"./openvla/experiments/robot/libero/{args.libero_task_suite}_init_states_and_goals.hdf5"
-        if os.path.exists(init_states_hdf5_path):
-            # Construct separate repo ID for init_states (e.g., "gberseth/libero_spatial_init_states")
-            username = args.hf_repo_id.split('/')[0]
-            init_states_repo_id = f"{username}/{args.libero_task_suite}_init_states"
+        # # Also push the init_states HDF5 data as a separate dataset
+        # init_states_hdf5_path = f"./openvla/experiments/robot/libero/{args.libero_task_suite}_init_states_and_goals.hdf5"
+        # if os.path.exists(init_states_hdf5_path):
+        #     # Construct separate repo ID for init_states (e.g., "gberseth/libero_spatial_init_states")
+        #     username = args.hf_repo_id.split('/')[0]
+        #     init_states_repo_id = f"{username}/{args.libero_task_suite}_init_states"
             
-            print(f"Creating dataset from init_states HDF5: {init_states_hdf5_path}")
+        #     print(f"Creating dataset from init_states HDF5: {init_states_hdf5_path}")
             
-            # Load init_states HDF5 and convert to dataset
-            init_states_data = []
-            with h5py.File(init_states_hdf5_path, 'r') as f:
-                for task_name in f.keys():
-                    task_grp = f[task_name]
-                    for demo_key in task_grp.keys():
-                        demo_grp = task_grp[demo_key]
-                        data_entry = {
-                            'task_name': task_name,
-                            'demo_id': demo_key,
-                            'init_state': demo_grp['init_state'][()],
-                        }
-                        # Add goal image if it exists
-                        if 'goal_img' in demo_grp:
-                            from PIL import Image as PILImage
-                            data_entry['goal_img'] = PILImage.fromarray(demo_grp['goal_img'][()].astype(np.uint8), mode='RGB')
+        #     # Load init_states HDF5 and convert to dataset
+        #     init_states_data = []
+        #     with h5py.File(init_states_hdf5_path, 'r') as f:
+        #         for task_name in f.keys():
+        #             task_grp = f[task_name]
+        #             for demo_key in task_grp.keys():
+        #                 demo_grp = task_grp[demo_key]
+        #                 data_entry = {
+        #                     'task_name': task_name,
+        #                     'demo_id': demo_key,
+        #                     'init_state': demo_grp['init_state'][()],
+        #                 }
+        #                 # Add goal image if it exists
+        #                 if 'goal_img' in demo_grp:
+        #                     from PIL import Image as PILImage
+        #                     data_entry['goal_img'] = PILImage.fromarray(demo_grp['goal_img'][()].astype(np.uint8), mode='RGB')
                         
-                        init_states_data.append(data_entry)
+        #                 init_states_data.append(data_entry)
             
-            # Create and push dataset
-            init_states_dataset = Dataset.from_list(init_states_data)
-            print(f"Created init_states dataset with {len(init_states_dataset)} entries")
-            print(f"Pushing init_states dataset to Hugging Face Hub: {init_states_repo_id}")
-            init_states_dataset.push_to_hub(init_states_repo_id, private=False)
-            print(f"Successfully pushed init_states dataset to {init_states_repo_id}")
-        else:
-            print(f"Warning: init_states HDF5 file not found at {init_states_hdf5_path}")
+        #     # Create and push dataset
+        #     init_states_dataset = Dataset.from_list(init_states_data)
+        #     print(f"Created init_states dataset with {len(init_states_dataset)} entries")
+        #     print(f"Pushing init_states dataset to Hugging Face Hub: {init_states_repo_id}")
+        #     init_states_dataset.push_to_hub(init_states_repo_id, private=False)
+        #     print(f"Successfully pushed init_states dataset to {init_states_repo_id}")
+        # else:
+        #     print(f"Warning: init_states HDF5 file not found at {init_states_hdf5_path}")
