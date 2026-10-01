@@ -28,6 +28,7 @@ Usage (with .venv/bin/python):
     python experiments/robot/libero/regenerate_libero_dataset.py push \
         --libero_task_suite libero_object \
         --libero_target_dir /network/projects/real-g-grp/libero/libero_object_no_noops/ \
+        --lerobot_root /network/projects/real-g-grp/libero/lerobot/libero_object_no_noops \
         --hf_repo_id gberseth/libero_object_no_noops_lerobot
 
     # 3) Check the pushed dataset: re-download it and replay episodes in LIBERO (see test_libero_dataset_replay.py)
@@ -262,7 +263,7 @@ if __name__ == "__main__":
     parser.add_argument("--image_resolution", type=int, default=64, help="Rendered image (and video) height and width")
     parser.add_argument("--task_id", type=int, default=None, help="Only regenerate this task (e.g. one SLURM array job per task)")
     parser.add_argument("--hf_repo_id", type=str, required=False, help="Hub repo, e.g. gberseth/libero_object_no_noops_lerobot")
-    parser.add_argument("--lerobot_root", type=str, default=None, help="Local directory for the LeRobot dataset (must not exist)")
+    parser.add_argument("--lerobot_root", type=str, default=None, help="Local directory for the LeRobot dataset (must not exist); keep it in /network/projects/real-g-grp/libero/lerobot/, not $HF_HOME")
     parser.add_argument("--max_demos_per_task", type=int, default=None, help="Only use the first N demos per task (for testing)")
     parser.add_argument("--no_push", action="store_true", help="Build the LeRobot dataset locally without pushing it")
     args = parser.parse_args()

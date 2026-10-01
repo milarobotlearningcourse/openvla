@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.10-blue?style=for-the-badge)](https://www.python.org)
 [![License](https://img.shields.io/github/license/TRI-ML/prismatic-vlms?style=for-the-badge)](LICENSE)
  
-[**Getting Started**](#getting-started) | [**Pretrained VLAs**](#pretrained-vlas) | [**Installation**](#installation) | [**Fine-Tuning OpenVLA via LoRA**](#fine-tuning-openvla-via-lora) | [**Fully Fine-Tuning OpenVLA**](#fully-fine-tuning-openvla) |
+[**Regenerating the robot datasets**](#regenerating-the-robot-datasets-lerobot-exports-for-mini-grp) | [**Getting Started**](#getting-started) | [**Pretrained VLAs**](#pretrained-vlas) | [**Installation**](#installation) | [**Fine-Tuning OpenVLA via LoRA**](#fine-tuning-openvla-via-lora) | [**Fully Fine-Tuning OpenVLA**](#fully-fine-tuning-openvla) |
 [**Training VLAs from Scratch**](#training-vlas-from-scratch) | [**Evaluating OpenVLA**](#evaluating-openvla) | [**Project Website**](https://openvla.github.io/)
 
 
@@ -21,6 +21,201 @@
 - [2024-08-14] Added new section, [Evaluating OpenVLA](#evaluating-openvla), with instructions for running BridgeData V2 WidowX robot evals
 - [2024-07-08] Added new sections: [Fine-Tuning OpenVLA via LoRA](#fine-tuning-openvla-via-lora), [Fully Fine-Tuning OpenVLA](#fully-fine-tuning-openvla)
 - [2024-06-13] Initial release
+
+<hr style="border: 2px solid gray;"></hr>
+
+## Regenerating the robot datasets (LeRobot exports for mini-grp)
+
+This fork also builds the robot datasets that [mini-grp](../mini-grp) trains on (`micro-vlm/mini_fm.py`, which loads
+them with `load_lerobots` in `mini-grp/data_loading.py`). Each one is a [LeRobotDataset v3.0](https://huggingface.co/docs/lerobot)
+on the Hugging Face Hub, with the same features, so they can be mixed in one training run:
+
+| Feature | Shape | Contents |
+|---|---|---|
+| `observation.images.image` | 64×64×3 video | agent (third-person) view |
+| `observation.images.wrist_image` | 64×64×3 video | wrist camera |
+| `observation.state` | 8 | end-effector position + axis-angle orientation + 2 gripper finger positions |
+| `observation.joint_state` | 7 | arm joint positions (mini-grp's pose input) |
+| `action` | 7 | end-effector delta position + delta axis-angle + gripper (−1 open, 1 close), at 20 Hz |
+
+Only demos that still succeed when checked in the simulator are kept, and each episode ends at its first success
+(LIBERO and ManiSkill; Bridge is real robot data, so it can't be checked in a simulator).
+Each dataset also stores what a replay or an eval needs to restart an episode in its simulator: `meta/libero_init_states.parquet`
+(LIBERO) or `meta/maniskill_episodes.parquet` (ManiSkill).
+
+| Hub dataset | Source | Episodes | Frames |
+|---|---|---|---|
+| `gberseth/libero_spatial_no_noops_lerobot` | LIBERO-Spatial | 443 | 54,442 |
+| `gberseth/libero_object_no_noops_lerobot` | LIBERO-Object | 464 | 68,388 |
+| `gberseth/libero_goal_no_noops_lerobot` | LIBERO-Goal | 431 | 52,869 |
+| `gberseth/libero_10_no_noops_lerobot` | LIBERO-10 | 382 | 101,850 |
+| `gberseth/libero_90_no_noops_lerobot` | LIBERO-90 | 3,933 | 571,207 |
+| `gberseth/maniskill_pusht_lerobot` | ManiSkill `PushT-v1` | 706 | 22,355 |
+| `gberseth/bridge_orig_lerobot` | BridgeData V2 (real WidowX) | 38,660 | 1,305,714 |
+
+Bridge (real WidowX data) differs from this layout in three ways: the export has no wrist camera (Bridge's is in only
+13% of its episodes), its `observation.joint_state` is zeros, and it runs at 5 Hz.
+
+**Dataset details.** For the details of every Open X-Embodiment dataset (robot, episodes, action space, cameras,
+language, collection method, control frequency), see the project's [dataset sheet](https://docs.google.com/spreadsheets/d/1rPBD77tk60AEIGZrGSODwyyzs5FgCU9Uz3h-3_t2A9g), the reference to check
+before adding one. mini-grp's `log/dataset_notes.md` has a copy of that table (with which datasets are on the cluster)
+and notes on the issues of the datasets we use.
+
+**Where files go.** All raw and intermediate data is in the project folder `/network/projects/real-g-grp/`, not `$HOME`,
+which is nearly full:
+- `libero/<suite>/`: the raw LIBERO HDF5 files;
+- `libero/<suite>_no_noops/`: the regenerated HDF5 files;
+- `libero/lerobot/`: the LIBERO LeRobot exports;
+- `maniskill/`: the ManiSkill demos, regenerated HDF5 files and LeRobot exports, and the ManiSkill assets
+  (`MS_ASSET_DIR`, e.g. the Bridge digital twins');
+- `bridge/`: the BridgeData V2 TFDS files (`bridge_dataset/1.0.0/`) and the LeRobot export (`lerobot/bridge_orig/`).
+
+**Environments.** Each simulator has its own uv env in this repo, with a uv-managed Python (no conda). Both LeRobot
+exports run in `.venv`, which has `lerobot`:
+```bash
+# LIBERO (robosuite + MuJoCo) and lerobot
+uv venv --python 3.10 --python-preference only-managed .venv
+uv pip install --python .venv/bin/python "lerobot>=0.4" h5py tqdm mujoco==3.4.0 robosuite==1.4.0 \
+    gym==0.25.2 bddl==1.0.1 easydict==1.9 future cloudpickle matplotlib
+uv pip install --python .venv/bin/python --no-deps -e ../LIBERO
+
+# ManiSkill (SAPIEN; its GPU sim and renderer need an NVIDIA GPU with Vulkan)
+uv venv --python 3.10 --python-preference only-managed .venv_maniskill
+uv pip install --python .venv_maniskill/bin/python mani_skill h5py tqdm
+```
+```bash
+# Bridge (reads TFDS with TensorFlow and writes the LeRobot export, in one env)
+uv venv --python 3.10 --python-preference only-managed .venv_bridge
+uv pip install --python .venv_bridge/bin/python tensorflow-cpu tensorflow-datasets lerobot==0.4.4 opencv-python-headless scipy tqdm
+```
+Pushing needs a Hugging Face login with write access (`huggingface-cli login`).
+
+### LIBERO (`experiments/robot/libero/regenerate_libero_dataset.py`)
+
+The raw LIBERO demos are human teleoperation, recorded at 256×256. Replaying them in the sim does three things:
+- re-renders the images at 64×64 (`--image_resolution`);
+- rotates them 180°, since the sim renders them upside down;
+- drops the no-op actions (no arm motion and no change of the gripper).
+
+Demos that fail on replay are dropped.
+
+```bash
+# 0) Download the raw demos (libero_100 is libero_10 + libero_90)
+.venv/bin/python ../LIBERO/benchmark_scripts/download_libero_datasets.py --use-huggingface \
+    --datasets libero_spatial --download-dir /network/projects/real-g-grp/libero/
+
+# 1) Replay them. Finished tasks are skipped, so a killed run can be resumed; --task_id N does one task
+#    (e.g. one Slurm array job per task)
+MUJOCO_GL=egl .venv/bin/python experiments/robot/libero/regenerate_libero_dataset.py regenerate \
+    --libero_task_suite libero_spatial \
+    --libero_raw_data_dir /network/projects/real-g-grp/libero/libero_spatial/ \
+    --libero_target_dir /network/projects/real-g-grp/libero/libero_spatial_no_noops/
+
+# 2) Export to LeRobot v3 and push (--lerobot_root must not exist yet; --no_push builds it locally only)
+.venv/bin/python experiments/robot/libero/regenerate_libero_dataset.py push \
+    --libero_task_suite libero_spatial \
+    --libero_target_dir /network/projects/real-g-grp/libero/libero_spatial_no_noops/ \
+    --lerobot_root /network/projects/real-g-grp/libero/lerobot/libero_spatial_no_noops \
+    --hf_repo_id gberseth/libero_spatial_no_noops_lerobot
+
+# 3) Check the pushed dataset: download it fresh and replay its episodes open loop in LIBERO with mini-grp's
+#    sim/sim_eval.py. Every replay should succeed; side-by-side videos go to outputs/replay_test/
+MUJOCO_GL=egl .venv/bin/python experiments/robot/libero/test_libero_dataset_replay.py \
+    --hf_repo_id gberseth/libero_spatial_no_noops_lerobot --libero_task_suite libero_spatial --episodes_per_task 2
+```
+The suites are `libero_spatial`, `libero_object`, `libero_goal`, `libero_10` and `libero_90`. LIBERO's own init states
+for a task are not the ones its demos started from, so the export saves each episode's first MuJoCo state in
+`meta/libero_init_states.parquet`.
+
+### ManiSkill (`experiments/robot/maniskill/regenerate_maniskill_dataset.py`)
+
+ManiSkill's [demos](https://maniskill.readthedocs.io/en/latest/user_guide/datasets/demos.html) (Hub `haosulab/ManiSkill_Demonstrations`)
+have no observations. Only `PushT-v1` is supported so far: 719 rollouts of a PPO policy, recorded with `pd_ee_delta_pose`
+on the GPU sim. Its robot (`panda_stick`) has a stick instead of a gripper and no wrist camera.
+
+These demos don't reproduce when their actions are replayed open loop: 57% succeed on the GPU sim and 0% on the CPU sim.
+Pushing is chaotic, and the demos were recorded with 1024 envs in parallel. So the converter restores the recorded env
+state at every step and renders it. The base camera is the agent view, and a camera 10 cm up the stick is the wrist view.
+
+A demo is kept if two checks pass:
+- ManiSkill's `evaluate()` reports success;
+- every recorded action, applied from its recorded state, lands the block within `--max_step_error` (1 cm) of the next
+  recorded state.
+
+For `PushT-v1` that keeps 706 of 719 demos (median one-step error 0.12 cm).
+
+To fit the layout above, the actions are clipped to [−1, 1], as the controller does, and padded with gripper −1 (open).
+Their scales differ from LIBERO's: ManiSkill moves 0.1 m and 0.1 rad per unit, LIBERO 0.05 m and 0.5 rad.
+
+```bash
+# 0) Download the demos
+MS_ASSET_DIR=/network/projects/real-g-grp/maniskill .venv_maniskill/bin/python -m mani_skill.utils.download_demo \
+    PushT-v1 -o /network/projects/real-g-grp/maniskill/demos
+
+# 1) Render and check them (on a GPU; about 18 min for PushT-v1 on an A100). --max_demos N for a quick test
+.venv_maniskill/bin/python experiments/robot/maniskill/regenerate_maniskill_dataset.py regenerate \
+    --env_id PushT-v1 --target_file /network/projects/real-g-grp/maniskill/PushT-v1_regenerated.h5
+
+# 2) Export to LeRobot v3 and push, with the LIBERO env, which has lerobot (--lerobot_root must not exist yet)
+.venv/bin/python experiments/robot/maniskill/regenerate_maniskill_dataset.py push \
+    --env_id PushT-v1 --target_file /network/projects/real-g-grp/maniskill/PushT-v1_regenerated.h5 \
+    --lerobot_root /network/projects/real-g-grp/maniskill/lerobot/PushT-v1 --hf_repo_id gberseth/maniskill_pusht_lerobot
+```
+`meta/maniskill_episodes.parquet` holds each episode's reset seed and first state. Calling `env.reset(seed=episode_seed)`
+and then `env.set_state(init_state)` restarts an episode exactly where its demo started.
+
+To add another ManiSkill task:
+1. Add its goal text and demo file to `TASKS` in the converter.
+2. In mini-grp's `sim/sim_eval.py`, which runs the ManiSkill sim evals during training, add a task set
+   `{env id: the same goal text}` to `MANISKILL_TASKS`, and map the Hub name to it in `MANISKILL_DATASETS`.
+3. If the task has a gripper, keep its gripper action instead of padding it.
+
+### Bridge (`experiments/robot/bridge/regenerate_bridge_dataset.py`)
+
+[BridgeData V2](https://rail-berkeley.github.io/bridgedata/) is teleoperated real data from a WidowX 250 arm. The
+export reads the official TFDS copy (`bridge_orig`: 53,192 train episodes). It does not use the copy in Open X-Embodiment,
+which is out of date and has about 25k episodes; that one is on the Hub as `jxu124/OpenX-Embodiment` and on the cluster in
+`/network/datasets/openxembodiment/datasets/bridge/0.1.0/`. `IPEC-COMMUNITY/bridge_orig_lerobot` has the same data in
+LeRobot v2.0, but at 256×256 with Euler angles and one file per episode (about 106k Hub files).
+
+The actions are relabelled as OpenVLA does in `prismatic/vla/datasets/rlds/oxe/transforms.py` (`bridge_orig_dataset_transform`):
+- the first step is dropped, since its action is all zeros;
+- the motion is the one the robot reached (the next state minus this one), not the commanded one, and the last step is
+  dropped;
+- the gripper is binarized.
+
+The rotation is stored as the axis-angle of R(next)·R(this)⁻¹ in the robot base frame. The state's roll-pitch-yaw is extrinsic
+`xyz`, which matched the commanded actions best of the conventions tried. Actions are in meters and radians per step,
+about 1 cm per step at 5 Hz, unlike the [−1, 1] actions of LIBERO and ManiSkill. Only the main camera (`image_0`) is exported. The wrist camera (`image_3`) is in only 13% of the episodes, and
+`image_1` and `image_2` (other fixed views) in 43%. It is exported as
+`observation.images.image`. Episodes without a language instruction (a third of them) are dropped, and the
+instructions are lowercased without a final period.
+
+```bash
+# 0) Download the TFDS files (132 GB with the val split; about 1.5 h)
+cd /network/projects/real-g-grp/bridge && wget -r -nH --cut-dirs=4 --reject="index.html*" \
+    https://rail.eecs.berkeley.edu/datasets/bridge_release/data/tfds/bridge_dataset/
+
+# 1) Export to LeRobot v3 and push (about 5 h on CPU; --max_episodes N --no_push for a quick test)
+.venv_bridge/bin/python experiments/robot/bridge/regenerate_bridge_dataset.py \
+    --lerobot_root /network/projects/real-g-grp/bridge/lerobot/bridge_orig --hf_repo_id gberseth/bridge_orig_lerobot
+# or the same as a Slurm CPU job, so it doesn't depend on an interactive session (log in outputs/slurm/)
+mkdir -p outputs/slurm && sbatch --job-name=export_bridge_orig_lerobot experiments/robot/bridge/export_bridge.sbatch
+```
+`--tfds_dir` reads another TFDS copy with the same features, e.g. the 743-episode subtask subset in
+`/network/projects/real-g-grp/tensorflow_datasets/bridge_subtasks/1.0.0`. The videos are 1 MB MP4 files of about 40
+episodes each (`--video_files_size_in_mb`). One MP4 per episode would be 35k Hub files, while opening a 200 MB file
+for every sample is slow. Sampling a frame from one of these takes 1.1 ms, against 0.45 ms with one file per episode.
+`meta/bridge_episodes.parquet` holds each episode's source file and episode id.
+
+mini-grp evaluates models trained on Bridge in ManiSkill's four
+[Bridge digital twins](https://maniskill.readthedocs.io/en/latest/tasks/digital_twins/index.html): carrot on plate, spoon
+on towel, stack the green cube on the yellow one, and eggplant in basket (`sim.task_sets=[bridge]` in `sim/sim_eval.py`).
+Their assets go in the project folder:
+```bash
+MS_ASSET_DIR=/network/projects/real-g-grp/maniskill .venv_maniskill/bin/python -m mani_skill.utils.download_asset bridge_v2_real2sim -y
+MS_ASSET_DIR=/network/projects/real-g-grp/maniskill .venv_maniskill/bin/python -m mani_skill.utils.download_asset widowx250s -y
+```
 
 <hr style="border: 2px solid gray;"></hr>
 
