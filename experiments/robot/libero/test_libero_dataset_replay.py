@@ -28,7 +28,7 @@ SETTLE_STEPS = 10  # no-op steps before the replay, as in regenerate_libero_data
 
 
 class LeRobotTrajectories:
-    """The episodes of a LeRobot v3 LIBERO dataset as the step lists eval_libero replays: [{"init_state", "action"}, ...]."""
+    """The episodes of a LeRobot v3 LIBERO dataset: their recorded actions and init states."""
 
     def __init__(self, root):
         frames = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "action"])
@@ -42,60 +42,23 @@ class LeRobotTrajectories:
         instruction, so match the demo file each episode came from, e.g. KITCHEN_SCENE2_..._demo.hdf5/demo_3. """
         return self.init.index[self.init["demo"].str.startswith(task_name + "_demo.hdf5/")].tolist()
 
-    def get_trajectory_by_goal_text(self, goal_text, trajectory_index=0, dataset_index=None):
-        ## eval_libero only passes the instruction, so the task (scene) being replayed is set in self.task_name
-        episode = self.episodes_of(self.task_name)[trajectory_index]
-        assert self.init.loc[episode, "task"] == goal_text, (episode, goal_text)
-        init_state = np.array(self.init.loc[episode, "init_state"])
-        return [{"init_state": init_state, "action": action} for action in self.actions[episode]]
-
-    def get_trajectory(self, index):
-        # eval_libero falls back to this when a lookup by task fails; replaying another task's episode would hide the error
-        raise RuntimeError(f"No episode {index} for this task: episodes must be selected by task")
 
 
 class LeRobotReplayModel(nn.Module):
-    """The model interface eval_libero calls, returning the loaded trajectory's recorded actions in order."""
+    """ What eval_libero replays open loop (a model with recorded_episode, like mini-grp's ReplayModel): the dataset's
+    episodes of the task being tested (dataset.task_name; in libero_90 several scenes share an instruction). """
 
-    def __init__(self, dataset):
+    def __init__(self, dataset, cfg):
         super().__init__()
-        self.dataset = dataset
-        self.trajectory_loaded = True  # tells eval_libero to load a trajectory per episode and start from its init state
-        self.trajectory, self.step = None, 0
+        self.dataset, self._cfg = dataset, cfg
 
-    def load_trajectory(self, trajectory):
-        self.trajectory, self.step = trajectory, 0
+    def recorded_episode(self, goal_text, index):
+        episode = self.dataset.episodes_of(self.dataset.task_name)[index]
+        assert self.dataset.init.loc[episode, "task"] == goal_text, (episode, goal_text)
+        return np.array(self.dataset.init.loc[episode, "init_state"]), self.dataset.actions[episode]
 
-    def reset(self):
-        self.step = 0
-        return self.trajectory[0]["init_state"]
-
-    def forward(self, *args, **kwargs):
-        if self.step < len(self.trajectory):
-            action = self.trajectory[self.step]["action"]
-        else:  # Past the end: hold still, keeping the last gripper command
-            action = np.zeros(7, dtype=np.float32)
-            action[-1] = self.trajectory[-1]["action"][-1]
-        self.step += 1
-        return torch.tensor(action, dtype=torch.float32)[None], None
-
-    def encode_text_goal(self, goal, tokenizer=None, text_model=None):
-        return 0
-
-    def preprocess_state(self, state):
-        return state
-
-    def preprocess_goal_image(self, goal_img):
-        return goal_img
-
-    def encode_pose(self, pose):
-        return pose
-
-    def encode_action(self, action):
-        return action
-
-    def decode_action(self, action):
-        return action
+    def preprocess_goal_image(self, image):
+        return image
 
 
 def check_init_states(task_suite, task_ids, dataset, episodes_per_task):
@@ -204,21 +167,20 @@ def main(args):
     cfg = OmegaConf.create({
         "sim": {"task_set": args.libero_task_suite, "eval_tasks": [],
                 "num_init_states": list(range(args.episodes_per_task)),  # trajectory index within each task
-                "episode_length": max(len(dataset.actions[e]) for e in selected) + 5, "wait_steps": SETTLE_STEPS},
-        "policy": {"obs_stacking": 1, "action_stacking": 1},
-        "action_dim": 7, "device": "cpu", "testing": True, "dataset": {"encode_with_t5": False},
+                "wait_steps": SETTLE_STEPS},  # eval_libero replays each episode to its end
+        "policy": {"action_stacking": 1, "use_pose_data": False}, "device": "cpu",
     })
     per_task = {}
     for task_id in task_ids:  # one task at a time, so the replay model knows which scene's episodes to replay
         dataset.task_name = task_suite.get_task(task_id).name
         cfg.sim.eval_tasks = [int(task_id)]
-        per_task[int(task_id)] = eval_libero(LeRobotReplayModel(dataset), device="cpu", cfg=cfg, log_dir=log_dir)
+        per_task[int(task_id)] = eval_libero(LeRobotReplayModel(dataset, cfg), cfg, log_dir=log_dir)
     comparison_videos(root, dataset, task_suite, task_ids, args.episodes_per_task, log_dir, os.path.join(out_dir, "compare"))
 
     print(f"\nReplayed {len(selected)} episodes of {args.hf_repo_id} (videos in {log_dir}):")
     for task_id, stats in per_task.items():
         n = stats["num_episodes"]
-        print(f"  task {task_id}: {round(stats['success_rate'] * n)}/{n} succeeded  {stats['task_name']}")
+        print(f"  task {task_id}: {round(stats['success_rate'] * n)}/{n} succeeded  {task_suite.get_task(task_id).name}")
     success_rate = float(np.mean([s["success_rate"] for s in per_task.values()]))
     print(f"Overall success rate: {success_rate:.3f}")
     return success_rate
