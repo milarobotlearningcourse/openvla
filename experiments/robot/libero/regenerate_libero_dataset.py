@@ -225,9 +225,10 @@ def push_to_huggingface_lerobot(args):
             res = res or next((d["obs/agentview_rgb"].shape[1] for d in f["data"].values()), None)
     dataset = LeRobotDataset.create(repo_id=args.hf_repo_id, root=args.lerobot_root, fps=FPS,
                                     features=libero_features(res), robot_type="panda")
-    # One MP4 per episode (by default v3 appends episodes to one file until it reaches 200 MB), so a loader that samples
-    # a trajectory only opens and seeks in that trajectory's small video
-    dataset.meta.update_chunk_settings(video_files_size_in_mb=1e-6)
+    # The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 500 MB.
+    # One MP4 per episode (as before 2026-10-12) made ~8k Hub files for libero_90, which the Hub's rate limit takes an hour
+    # to download; loaders seek to each episode's videos/<camera>/from_timestamp in its file.
+    dataset.meta.update_chunk_settings(video_files_size_in_mb=500)
     for task, name, demo in tqdm.tqdm(iter_demos(args.libero_target_dir, args.max_demos_per_task), desc="Exporting demos"):
         obs = {k: v[()] for k, v in demo["obs"].items()}
         actions = demo["actions"][()].astype(np.float32)
