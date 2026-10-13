@@ -225,10 +225,10 @@ def push_to_huggingface_lerobot(args):
             res = res or next((d["obs/agentview_rgb"].shape[1] for d in f["data"].values()), None)
     dataset = LeRobotDataset.create(repo_id=args.hf_repo_id, root=args.lerobot_root, fps=FPS,
                                     features=libero_features(res), robot_type="panda")
-    # The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 500 MB.
+    # The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 100 MB (--video_files_size_in_mb).
     # One MP4 per episode (as before 2026-10-12) made ~8k Hub files for libero_90, which the Hub's rate limit takes an hour
     # to download; loaders seek to each episode's videos/<camera>/from_timestamp in its file.
-    dataset.meta.update_chunk_settings(video_files_size_in_mb=500)
+    dataset.meta.update_chunk_settings(video_files_size_in_mb=args.video_files_size_in_mb)
     for task, name, demo in tqdm.tqdm(iter_demos(args.libero_target_dir, args.max_demos_per_task), desc="Exporting demos"):
         obs = {k: v[()] for k, v in demo["obs"].items()}
         actions = demo["actions"][()].astype(np.float32)
@@ -266,6 +266,7 @@ if __name__ == "__main__":
     parser.add_argument("--hf_repo_id", type=str, required=False, help="Hub repo, e.g. gberseth/libero_object_no_noops_lerobot")
     parser.add_argument("--lerobot_root", type=str, default=None, help="Local directory for the LeRobot dataset (must not exist); keep it in /network/projects/real-g-grp/libero/lerobot/, not $HF_HOME")
     parser.add_argument("--max_demos_per_task", type=int, default=None, help="Only use the first N demos per task (for testing)")
+    parser.add_argument("--video_files_size_in_mb", type=float, default=100, help="Start a new MP4 file past this size; lerobot rewrites the whole MP4 to append each episode, so smaller files export faster (lerobot/droid_1.0.1 uses 500)")
     parser.add_argument("--no_push", action="store_true", help="Build the LeRobot dataset locally without pushing it")
     args = parser.parse_args()
 

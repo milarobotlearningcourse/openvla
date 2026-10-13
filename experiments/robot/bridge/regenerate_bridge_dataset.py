@@ -25,7 +25,7 @@ Notes:
 
 Setup (own uv env, with TensorFlow to read TFDS and lerobot to write the export; uv-managed Python, no conda):
     uv venv --python 3.10 --python-preference only-managed .venv_bridge
-    uv pip install --python .venv_bridge/bin/python tensorflow-cpu tensorflow-datasets lerobot==0.4.4 opencv-python-headless scipy tqdm
+    uv pip install --python .venv_bridge/bin/python tensorflow-cpu tensorflow-datasets "tensorflow-metadata>=1.16" lerobot==0.4.4 opencv-python-headless scipy tqdm
 
 Usage:
     # 1) Download the TFDS files (132 GB, to the project folder, not $HOME)
@@ -101,7 +101,7 @@ def export(args):
     source = tfds.builder_from_directory(args.tfds_dir).as_dataset(split=split)
     dataset = LeRobotDataset.create(repo_id=args.hf_repo_id, root=args.lerobot_root, fps=FPS,
                                     features=bridge_features(args.image_resolution), robot_type="widowx")
-    ## The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 500 MB: few Hub files
+    ## The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 100 MB (--video_files_size_in_mb): few Hub files
     ## to download (the Hub rate-limits requests); loaders seek to each episode's videos/<camera>/from_timestamp in its file.
     dataset.meta.update_chunk_settings(video_files_size_in_mb=args.video_files_size_in_mb)
     episodes, skipped = [], 0
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--tfds_dir", type=str, default="/network/projects/real-g-grp/bridge/bridge_dataset/1.0.0")
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--image_resolution", type=int, default=64, help="Image (and video) height and width")
-    parser.add_argument("--video_files_size_in_mb", type=float, default=500, help="Start a new MP4 file past this size (500, as lerobot/droid_1.0.1)")
+    parser.add_argument("--video_files_size_in_mb", type=float, default=100, help="Start a new MP4 file past this size; lerobot rewrites the whole MP4 to append each episode, so smaller files export faster (lerobot/droid_1.0.1 uses 500)")
     parser.add_argument("--max_episodes", type=int, default=None, help="Only use the first N episodes (for testing)")
     parser.add_argument("--hf_repo_id", type=str, required=True, help="Hub repo, e.g. gberseth/bridge_orig_lerobot")
     parser.add_argument("--lerobot_root", type=str, required=True, help="Local directory for the LeRobot dataset (must not exist)")

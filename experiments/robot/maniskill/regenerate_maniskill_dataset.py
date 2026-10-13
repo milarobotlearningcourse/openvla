@@ -227,7 +227,7 @@ def push_to_huggingface_lerobot(args):
     robots = sorted({f["data"].attrs.get("robot", "panda_stick") for f in files})  # PushT's file predates the attribute
     dataset = LeRobotDataset.create(repo_id=args.hf_repo_id, root=args.lerobot_root, fps=FPS,
                                     features=maniskill_features(res), robot_type="+".join(robots))
-    dataset.meta.update_chunk_settings(video_files_size_in_mb=1e-6)  # one MP4 per episode, as for LIBERO
+    dataset.meta.update_chunk_settings(video_files_size_in_mb=args.video_files_size_in_mb)  # many episodes per MP4, as LIBERO and lerobot/droid_1.0.1
     episodes = []
     for env_id, f in zip(args.env_ids, files):
         grp = f["data"]
@@ -273,6 +273,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_demos", type=int, default=None, help="Only use the first N demos (for testing)")
     parser.add_argument("--hf_repo_id", type=str, help="Hub repo, e.g. gberseth/maniskill_panda_lerobot")
     parser.add_argument("--lerobot_root", type=str, help="Local directory for the LeRobot dataset (must not exist)")
+    parser.add_argument("--video_files_size_in_mb", type=float, default=100, help="Start a new MP4 file past this size; lerobot rewrites the whole MP4 to append each episode, so smaller files export faster (lerobot/droid_1.0.1 uses 500)")
     parser.add_argument("--no_push", action="store_true", help="Build the LeRobot dataset locally without pushing it")
     args = parser.parse_args()
     if args.step == "regenerate":
