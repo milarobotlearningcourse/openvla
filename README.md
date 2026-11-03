@@ -68,7 +68,8 @@ which is nearly full:
 - `libero/lerobot/`: the LIBERO LeRobot exports;
 - `maniskill/`: the ManiSkill demos, regenerated HDF5 files and LeRobot exports, and the ManiSkill assets
   (`MS_ASSET_DIR`, e.g. the Bridge digital twins');
-- `bridge/`: the BridgeData V2 TFDS files (`bridge_dataset/1.0.0/`) and the LeRobot export (`lerobot/bridge_orig/`).
+- `bridge/`: the BridgeData V2 TFDS files (`bridge_dataset/1.0.0/`) and the LeRobot export (`lerobot/bridge_orig/`);
+- `autobio/`: the generated AutoBio HDF5 files and the LeRobot export (`lerobot/`).
 
 **Environments.** Each simulator has its own uv env in this repo, with a uv-managed Python (no conda). Both LeRobot
 exports run in `.venv`, which has `lerobot`:
@@ -82,6 +83,12 @@ uv pip install --python .venv/bin/python --no-deps -e ../LIBERO
 # ManiSkill (SAPIEN; its GPU sim and renderer need an NVIDIA GPU with Vulkan)
 uv venv --python 3.10 --python-preference only-managed .venv_maniskill
 uv pip install --python .venv_maniskill/bin/python mani_skill h5py tqdm
+```
+```bash
+# AutoBio (MuJoCo, as LIBERO; AutoBio's code is cloned next to this repo, ../AutoBio, and needs no install)
+uv venv --python 3.12 --python-preference only-managed .venv_autobio
+uv pip install --python .venv_autobio/bin/python mujoco==3.4.0 numpy scipy "jax[cpu]" toppra trimesh shapely \
+    triangle manifold3d sympy zstandard tqdm networkx matplotlib scikit-image h5py "imageio[ffmpeg]"
 ```
 ```bash
 # Bridge (reads TFDS with TensorFlow and writes the LeRobot export, in one env)
@@ -169,6 +176,43 @@ To add another ManiSkill task:
 2. In mini-grp's `sim/sim_eval.py`, which runs the ManiSkill sim evals during training, add a task set
    `{env id: the same goal text}` to `MANISKILL_TASKS`, and map the Hub name to it in `MANISKILL_DATASETS`.
 3. If the task has a gripper, keep its gripper action instead of padding it.
+
+### AutoBio (`experiments/robot/autobio/regenerate_autobio_dataset.py`)
+
+[AutoBio](https://github.com/autobio-bench/AutoBio) ([arXiv 2505.14030](https://arxiv.org/abs/2505.14030)) is a MuJoCo
+benchmark of high-precision biology-lab tasks. Its code goes next to this repo:
+`git clone https://github.com/autobio-bench/AutoBio ../AutoBio` (or set `AUTOBIO_DIR` to its `autobio/` folder).
+
+The converter generates the demos with AutoBio's scripted experts instead of converting AutoBio's own Hub datasets.
+Those were recorded at 50 fps, with joint-position actions and no object states. Ours record two 128×128 cameras at
+20 Hz, the experts' control rate, with the layout above, and keep each episode's seed, so `make_task(name).reset(seed)`
+restarts it. Supported so far: AutoBio's 5 single-arm tasks (a UR5e, or one Aloha arm). The bimanual ones come later.
+
+AutoBio's scenes need its closed binary MuJoCo plugins (`libmjlab.so`, built for MuJoCo 3.3.0 only). We don't use them:
+the converter runs the scenes on a plugin-free copy of AutoBio's models (`../AutoBio/autobio/model_noplugin/`, written on
+first use), with simpler physics:
+- each tube's screw cap is welded to it (no threads);
+- the thermal cycler's lid lever has friction instead of its detent.
+
+The `check` step replays each demo's actions with the controller a sim eval uses (`ee_delta_to_ctrl`: differential IK,
+each step's target chained from the last). Pickup, insert, thermal_cycler_close and insert_centrifuge_5430 replay 10/10;
+thermal_mixer 0/10, which is still open.
+
+```bash
+# 1) Generate the demos (one HDF5 file per task; only demos that succeed are kept)
+MUJOCO_GL=egl .venv_autobio/bin/python experiments/robot/autobio/regenerate_autobio_dataset.py regenerate \
+    --tasks pickup insert --num_demos 100 --target_dir /network/projects/real-g-grp/autobio
+
+# 2) Replay their actions with the eval's controller and report the success rate
+MUJOCO_GL=egl .venv_autobio/bin/python experiments/robot/autobio/regenerate_autobio_dataset.py check \
+    --tasks pickup insert --target_dir /network/projects/real-g-grp/autobio --max_demos 20
+
+# 3) Export to LeRobot v3 and push, with the LIBERO env, which has lerobot
+.venv/bin/python experiments/robot/autobio/regenerate_autobio_dataset.py push --tasks pickup insert \
+    --target_dir /network/projects/real-g-grp/autobio --lerobot_root /network/projects/real-g-grp/autobio/lerobot \
+    --hf_repo_id gberseth/autobio_lerobot
+```
+`meta/autobio_episodes.parquet` holds each episode's AutoBio task and reset seed.
 
 ### Bridge (`experiments/robot/bridge/regenerate_bridge_dataset.py`)
 
