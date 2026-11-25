@@ -15,7 +15,7 @@ Setup (own uv env in openvla/.venv, separate from the training code; uv-managed 
     uv venv --python 3.10 --python-preference only-managed .venv
     uv pip install --python .venv/bin/python "lerobot>=0.4" h5py tqdm mujoco==3.4.0 robosuite==1.4.0 \
         gym==0.25.2 bddl==1.0.1 easydict==1.9 future cloudpickle matplotlib
-    uv pip install --python .venv/bin/python --no-deps -e ../LIBERO
+    uv pip install --python .venv/bin/python --no-deps -e ../LIBERO-Industry  # the LIBERO fork mini-grp simulates
 
 Usage (with .venv/bin/python):
     # 1) Replay demos (optionally one task per job with --task_id)
@@ -30,6 +30,9 @@ Usage (with .venv/bin/python):
         --libero_target_dir /network/projects/real-g-grp/libero/libero_object_no_noops/ \
         --lerobot_root /network/projects/real-g-grp/libero/lerobot/libero_object_no_noops \
         --hf_repo_id gberseth/libero_object_no_noops_lerobot
+    # with --object_state, the episodes also get observation.object_state, each object's pose (for state policies, e.g.
+    # mini-grp's MLP), as a separate dataset, e.g. gberseth/libero_spatial_no_noops_state_lerobot
+    # (regenerate records it as obs/object_states; regenerate_libero_state.sh runs both steps on a GPU node)
 
     # 3) Check the pushed dataset: re-download it and replay episodes in LIBERO (see test_libero_dataset_replay.py)
     MUJOCO_GL=egl python experiments/robot/libero/test_libero_dataset_replay.py \
@@ -76,8 +79,16 @@ def get_libero_env(task, resolution):
     return env, task.language
 
 
-def replay_demo(env, demo_data):
-    """Replays one demo without its no-op actions. Returns (success, dict of recorded arrays)."""
+def object_pose(obs, objects):
+    """Each of objects' position and quaternion (xyzw, LIBERO's object sensors) from a LIBERO observation, zeros for an
+    object the task hasn't: one observation.object_state."""
+    return np.concatenate([np.concatenate([obs[f"{o}_pos"], obs[f"{o}_quat"]]) if f"{o}_pos" in obs else np.zeros(7)
+                           for o in objects])
+
+
+def replay_demo(env, demo_data, objects=()):
+    """Replays one demo without its no-op actions. Returns (success, dict of recorded arrays); with objects (names),
+    also object_states, their poses at each frame (object_pose)."""
     import robosuite.utils.transform_utils as T
 
     orig_actions = demo_data["actions"][()]
@@ -90,7 +101,7 @@ def replay_demo(env, demo_data):
         obs, reward, done, info = env.step([0, 0, 0, 0, 0, 0, -1])
 
     rec = {k: [] for k in ["states", "actions", "ee_states", "gripper_states", "joint_states",
-                           "robot_states", "agentview_rgb", "eye_in_hand_rgb"]}
+                           "robot_states", "agentview_rgb", "eye_in_hand_rgb", "object_states"]}
     for action in orig_actions:
         if is_noop(action, rec["actions"][-1] if rec["actions"] else None):
             continue
@@ -109,6 +120,7 @@ def replay_demo(env, demo_data):
         ## Rotate images by 180 degrees to account for upside-down rendering
         rec["agentview_rgb"].append(np.rot90(obs["agentview_image"], 2))
         rec["eye_in_hand_rgb"].append(np.rot90(obs["robot0_eye_in_hand_image"], 2))
+        rec["object_states"].append(object_pose(obs, objects))
         obs, reward, done, info = env.step(action.tolist())
 
     rec = {k: np.stack(v) for k, v in rec.items()} if rec["actions"] else {}
@@ -131,6 +143,9 @@ def regenerate(args):
     os.makedirs(args.libero_target_dir, exist_ok=True)
     task_suite = benchmark.get_benchmark_dict()[args.libero_task_suite]()
     task_ids = range(task_suite.n_tasks) if args.task_id is None else [args.task_id]
+    ## every object of the suite's tasks, sorted: one fixed-size object_states vector for all its demos
+    objects = sorted({o for names in suite_objects(task_suite).values() for o in names})
+    print(f"object_states: the poses of {len(objects)} objects: {objects}")
 
     for task_id in tqdm.tqdm(task_ids):
         task = task_suite.get_task(task_id)
@@ -146,16 +161,17 @@ def regenerate(args):
             orig_data = orig_file["data"]
             grp = new_file.create_group("data")
             grp.attrs["language_instruction"] = task_description
+            grp.attrs["objects"] = json.dumps(objects)  # the order of obs/object_states
             success_per_demo = {}
             for i in range(len(orig_data.keys()))[:args.max_demos_per_task]:
-                done, rec = replay_demo(env, orig_data[f"demo_{i}"])
+                done, rec = replay_demo(env, orig_data[f"demo_{i}"], objects)
                 success_per_demo[f"demo_{i}"] = done
                 if not done:  # Only keep successful replays
                     continue
                 n = len(rec["actions"])
                 ep = grp.create_group(f"demo_{i}")
                 obs_grp = ep.create_group("obs")
-                for k in ["gripper_states", "joint_states", "ee_states", "agentview_rgb", "eye_in_hand_rgb"]:
+                for k in ["gripper_states", "joint_states", "ee_states", "agentview_rgb", "eye_in_hand_rgb", "object_states"]:
                     obs_grp.create_dataset(k, data=rec[k])
                 obs_grp.create_dataset("ee_pos", data=rec["ee_states"][:, :3])
                 obs_grp.create_dataset("ee_ori", data=rec["ee_states"][:, 3:])
@@ -173,8 +189,13 @@ def regenerate(args):
               f"successful replays -> {new_data_path}")
 
 
-def libero_features(res):
+def libero_features(res, objects=None):
+    """The LeRobot features; with objects (names), also observation.object_state: each object's position and
+    quaternion (xyzw, as LIBERO's object sensors give them), in that order."""
     return {
+        **({"observation.object_state": {
+            "dtype": "float32", "shape": (7 * len(objects),),
+            "names": [f"{o}_{c}" for o in objects for c in ("x", "y", "z", "qx", "qy", "qz", "qw")]}} if objects else {}),
         "observation.images.image": {"dtype": "video", "shape": (res, res, 3), "names": ["height", "width", "channels"]},
         "observation.images.wrist_image": {"dtype": "video", "shape": (res, res, 3), "names": ["height", "width", "channels"]},
         "observation.state": {  # End effector position + axis-angle orientation + gripper joint positions
@@ -200,6 +221,66 @@ def iter_demos(target_dir, max_demos_per_task=None):
                 yield task, f"{hdf5_file}/{demo_key}", data_grp[demo_key]
 
 
+def suite_objects(task_suite):
+    """The movable objects of every task of task_suite (a LIBERO benchmark), which LIBERO gives pose sensors
+    (<name>_pos, <name>_quat): {task name: [object names]}, read from the BDDL files without building envs."""
+    from libero.libero import get_libero_path
+    from libero.libero.envs.bddl_utils import robosuite_parse_problem
+
+    objects = {}
+    for t in range(task_suite.n_tasks):
+        task = task_suite.get_task(t)
+        problem = robosuite_parse_problem(os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file))
+        objects[task.name] = [o for names in problem["objects"].values() for o in names]  # {category: [names]}
+    return objects
+
+
+class ObjectStates:
+    """The object_state of each frame of the regenerated demos (observation.object_state): each of objects' position
+    and quaternion, zeros for an object the demo's task hasn't. They are read in a LIBERO env without cameras
+    (ControlEnv) that replays the demo as regenerate recorded it: its initial state, the 10 settling no-ops, then its
+    actions, the observation before each action being its frame's. Each frame's joint positions are checked against the
+    demo's: the replay reproduces them to about 1e-7 (MuJoCo is deterministic). Setting the saved states instead does
+    not: their qpos differ from the recorded observations by about 4e-4 rad."""
+
+    def __init__(self, task_suite, objects):
+        self.tasks = {task_suite.get_task(t).name: task_suite.get_task(t) for t in range(task_suite.n_tasks)}
+        self.objects, self.env, self.env_task, self.max_joint_error = objects, None, None, 0.0
+
+    def __call__(self, hdf5_file, demo):
+        from libero.libero import get_libero_path
+        from libero.libero.envs.env_wrapper import ControlEnv
+
+        name = hdf5_file.replace("_demo.hdf5", "")
+        if name != self.env_task:
+            if self.env is not None:
+                self.env.close()
+            task = self.tasks[name]
+            self.env = ControlEnv(bddl_file_name=os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file),
+                                  has_renderer=False, has_offscreen_renderer=False, use_camera_obs=False)
+            self.env.seed(0)  # as regenerate's env
+            self.env_task = name
+        env = self.env
+        env.reset()
+        env.set_init_state(demo["init_states"][()])
+        for _ in range(10):  # as replay_demo
+            obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
+        poses, joints = [], []
+        for action in demo["actions"][()]:
+            poses.append(np.concatenate([np.concatenate([obs[f"{o}_pos"], obs[f"{o}_quat"]]) if f"{o}_pos" in obs else np.zeros(7)
+                                         for o in self.objects]))
+            joints.append(obs["robot0_joint_pos"])
+            obs, _, _, _ = env.step(action.tolist())
+        error = float(np.abs(np.stack(joints) - demo["obs/joint_states"][()]).max())
+        self.max_joint_error = max(self.max_joint_error, error)
+        assert error < 1e-4, f"{hdf5_file}: the replayed joint positions differ from the demo's by {error}"
+        return np.stack(poses).astype(np.float32)
+
+    def close(self):
+        if self.env is not None:
+            self.env.close()
+
+
 def write_init_states(target_dir, lerobot_root, max_demos_per_task=None):
     """Writes meta/libero_init_states.parquet: the MuJoCo state each episode starts from, which is needed to replay it
     in LIBERO. Its size differs between tasks, so it can't be a fixed-shape LeRobot feature."""
@@ -223,8 +304,15 @@ def push_to_huggingface_lerobot(args):
     for hdf5_file in hdf5_files:
         with h5py.File(os.path.join(args.libero_target_dir, hdf5_file), "r") as f:
             res = res or next((d["obs/agentview_rgb"].shape[1] for d in f["data"].values()), None)
+    object_states = None
+    if args.object_state:  # the objects of all the suite's tasks, sorted: one fixed-size vector for every episode
+        from libero.libero import benchmark
+        task_suite = benchmark.get_benchmark_dict()[args.libero_task_suite]()
+        objects = sorted({o for names in suite_objects(task_suite).values() for o in names})
+        print(f"observation.object_state: the poses of {len(objects)} objects: {objects}")
+        object_states = ObjectStates(task_suite, objects)
     dataset = LeRobotDataset.create(repo_id=args.hf_repo_id, root=args.lerobot_root, fps=FPS,
-                                    features=libero_features(res), robot_type="panda")
+                                    features=libero_features(res, object_states and object_states.objects), robot_type="panda")
     # The layout of the official LeRobot datasets (e.g. lerobot/droid_1.0.1): many episodes per MP4, a new file past 100 MB (--video_files_size_in_mb).
     # One MP4 per episode (as before 2026-10-12) made ~8k Hub files for libero_90, which the Hub's rate limit takes an hour
     # to download; loaders seek to each episode's videos/<camera>/from_timestamp in its file.
@@ -233,8 +321,12 @@ def push_to_huggingface_lerobot(args):
         obs = {k: v[()] for k, v in demo["obs"].items()}
         actions = demo["actions"][()].astype(np.float32)
         state = np.concatenate([obs["ee_states"], obs["gripper_states"]], axis=1).astype(np.float32)
+        ## recorded by regenerate (since 2026-11-24); older files are replayed again
+        object_state = None if not object_states else (
+            obs["object_states"].astype(np.float32) if "object_states" in obs else object_states(name.split("/")[0], demo))
         for j in range(len(actions)):
             dataset.add_frame({
+                **({"observation.object_state": object_state[j]} if object_states else {}),
                 "task": task,
                 "observation.images.image": obs["agentview_rgb"][j],
                 "observation.images.wrist_image": obs["eye_in_hand_rgb"][j],
@@ -244,6 +336,9 @@ def push_to_huggingface_lerobot(args):
             })
         dataset.save_episode()
     dataset.finalize()  # Closes parquet writers, writes metadata footers
+    if object_states:
+        object_states.close()
+        print(f"object_state: replayed joint positions within {object_states.max_joint_error:.2e} of the demos'")
     write_init_states(args.libero_target_dir, dataset.root, args.max_demos_per_task)  # pushed with meta/
     print(f"Created dataset with {dataset.meta.total_episodes} episodes and {dataset.meta.total_frames} frames")
 
@@ -267,6 +362,8 @@ if __name__ == "__main__":
     parser.add_argument("--lerobot_root", type=str, default=None, help="Local directory for the LeRobot dataset (must not exist); keep it in /network/projects/real-g-grp/libero/lerobot/, not $HF_HOME")
     parser.add_argument("--max_demos_per_task", type=int, default=None, help="Only use the first N demos per task (for testing)")
     parser.add_argument("--video_files_size_in_mb", type=float, default=100, help="Start a new MP4 file past this size; lerobot rewrites the whole MP4 to append each episode, so smaller files export faster (lerobot/droid_1.0.1 uses 500)")
+    parser.add_argument("--object_state", action="store_true",
+                        help="Also export observation.object_state: every object's pose, read from the saved MuJoCo states (ObjectStates)")
     parser.add_argument("--no_push", action="store_true", help="Build the LeRobot dataset locally without pushing it")
     args = parser.parse_args()
 
