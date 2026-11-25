@@ -18,6 +18,7 @@ SUITE=${1:-libero_spatial}
 PY=.venv/bin/python
 RAW=/network/projects/real-g-grp/libero/${SUITE}/
 HDF5=/network/projects/real-g-grp/libero/${SUITE}_no_noops_state/
+EPISODES=$SLURM_TMPDIR/${SUITE}_no_noops_state_per_episode
 TMP=$SLURM_TMPDIR/${SUITE}_no_noops_state
 OUT=/network/projects/real-g-grp/libero/lerobot/${SUITE}_no_noops_state
 ## LIBERO is ../LIBERO-Industry, installed once in .venv (regenerate_libero_dataset.py's setup) and the one
@@ -26,9 +27,14 @@ $PY -c "import libero.libero as l, os; assert 'LIBERO-Industry' in os.path.realp
 export MUJOCO_GL=egl
 $PY experiments/robot/libero/regenerate_libero_dataset.py regenerate \
     --libero_task_suite $SUITE --libero_raw_data_dir $RAW --libero_target_dir $HDF5
+## exported one MP4 per episode, then relaid out into 100 MB MP4s with each episode's packets copied once and checked:
+## lerobot's own many-episodes-per-MP4 export rewrites the shared file for every episode and damages packets (it did in
+## libero_90, and in this suite's first export: mini-grp's decoder failed on it, 2026-11-24)
 $PY experiments/robot/libero/regenerate_libero_dataset.py push --object_state --no_push \
-    --libero_task_suite $SUITE --libero_target_dir $HDF5 --lerobot_root $TMP \
-    --hf_repo_id gberseth/${SUITE}_no_noops_state_lerobot
+    --libero_task_suite $SUITE --libero_target_dir $HDF5 --lerobot_root $EPISODES \
+    --hf_repo_id gberseth/${SUITE}_no_noops_state_lerobot --video_files_size_in_mb 0.000001
+$PY experiments/robot/libero/relayout_lerobot_videos.py $EPISODES $TMP --video_files_size_in_mb 100
 ls -la $TMP/meta $TMP/data/*/ $TMP/videos/*/chunk-000
 rm -rf $OUT && cp -r $TMP $OUT
+$PY experiments/robot/libero/relayout_lerobot_videos.py $EPISODES $OUT --check_only
 echo "$SUITE done: $HDF5 and $OUT"

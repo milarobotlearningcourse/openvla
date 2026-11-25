@@ -293,6 +293,67 @@ def write_init_states(target_dir, lerobot_root, max_demos_per_task=None):
     return path
 
 
+VIDEO_SOURCES = {"observation.images.image": "agentview_rgb", "observation.images.wrist_image": "eye_in_hand_rgb"}
+
+
+def decodes(path):
+    """Whether every packet of an MP4's video stream decodes, and its number of frames."""
+    import av
+
+    frames = 0
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        for packet in container.demux(stream):
+            if packet.pts is None:
+                continue
+            try:
+                frames += len(packet.decode())
+            except av.error.InvalidDataError:
+                return False, frames
+        frames += len(stream.codec_context.decode(None))  # the frames the decoder still holds
+    return True, frames
+
+
+def repair_episode_videos(root, target_dir, max_demos_per_task=None, attempts=3):
+    """Re-encodes, from the regenerated HDF5s, every episode video of an export with one MP4 per episode that has a packet
+    that fails to decode: lerobot's AV1 encoding (libsvtav1) now and then writes one (libero_spatial's export of
+    2026-11-24 had 1 to 3 per camera, a different episode each time). With lerobot's encoder and settings, single-threaded,
+    up to `attempts` times until every packet decodes; the frame count, and so the metadata, stays the same."""
+    import tempfile
+    import pandas as pd
+    from PIL import Image
+    from lerobot.datasets.video_utils import encode_video_frames
+
+    info = json.load(open(os.path.join(root, "meta", "info.json")))
+    episodes = pd.concat(pd.read_parquet(f) for f in sorted(
+        os.path.join(d, f) for d, _, fs in os.walk(os.path.join(root, "meta", "episodes")) for f in fs if f.endswith(".parquet")))
+    episodes = episodes.sort_values("episode_index").set_index("episode_index")
+    repaired = []
+    for n, (task, name, demo) in enumerate(iter_demos(target_dir, max_demos_per_task)):
+        for key, source in VIDEO_SOURCES.items():
+            ep = episodes.loc[n]
+            path = os.path.join(root, info["video_path"].format(video_key=key, chunk_index=int(ep[f"videos/{key}/chunk_index"]),
+                                                                 file_index=int(ep[f"videos/{key}/file_index"])))
+            same_file = ((episodes[f"videos/{key}/chunk_index"] == ep[f"videos/{key}/chunk_index"])
+                         & (episodes[f"videos/{key}/file_index"] == ep[f"videos/{key}/file_index"]))
+            assert same_file.sum() == 1, f"{path} holds {same_file.sum()} episodes: not one MP4 per episode"
+            ok, _ = decodes(path)
+            if not ok:
+                repaired.append((n, key))
+            for attempt in range(attempts):
+                if ok:
+                    break
+                with tempfile.TemporaryDirectory() as images:
+                    for j, frame in enumerate(demo["obs"][source][()]):
+                        Image.fromarray(frame).save(os.path.join(images, f"frame-{j:06d}.png"))
+                    encode_video_frames(images, path, FPS, overwrite=True, encoder_threads=1)
+                ok, frames = decodes(path)
+                assert frames == ep["length"] or not ok, f"episode {n} {key}: {frames} frames, not {ep['length']}"
+                print(f"episode {n} ({name}) {key}: re-encoded (attempt {attempt + 1}), {'decodes' if ok else 'still damaged'}", flush=True)
+            assert ok, f"episode {n} {key}: still damaged after {attempts} re-encodings"
+    print(f"episode videos: every packet decodes ({len(repaired)} re-encoded: {repaired})", flush=True)
+
+
 def push_to_huggingface_lerobot(args):
     """Converts the regenerated HDF5 files into a LeRobotDataset v3.0 and pushes it to the Hub."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -336,6 +397,8 @@ def push_to_huggingface_lerobot(args):
             })
         dataset.save_episode()
     dataset.finalize()  # Closes parquet writers, writes metadata footers
+    if args.video_files_size_in_mb < 1e-3:  # one MP4 per episode: re-encode any damaged one (before relayout_lerobot_videos.py)
+        repair_episode_videos(dataset.root, args.libero_target_dir, args.max_demos_per_task)
     if object_states:
         object_states.close()
         print(f"object_state: replayed joint positions within {object_states.max_joint_error:.2e} of the demos'")
